@@ -5,7 +5,7 @@ import base64
 import sys
 import re
 import requests
-from librespot.audio import FeederException
+from librespot.audio import FeederException, LoadedStream
 from librespot.audio.decoders import AudioQuality, SuperAudioFormat, FormatOnlyAudioQuality
 from librespot.core import Session, OAuth, MercuryRequests
 from librespot.metadata import TrackId, EpisodeId
@@ -623,11 +623,11 @@ class Zotify:
         with Loader(PrintChannel.MANDATORY, "Logging in..."):
             Zotify.login(args)
         
+        Printer.debug("Session Initialized Successfully")
         quality, bitrate = self.get_download_quality(Zotify.CONFIG.get_download_qual_pref())
         Zotify.DOWNLOAD_QUALITY = quality
         Zotify.DOWNLOAD_BITRATE = bitrate
-        
-        Printer.debug("Session Initialized Successfully")
+    
     
     @classmethod
     def start(cls) -> None:
@@ -682,6 +682,9 @@ class Zotify:
            return FormatOnlyAudioQuality(quality, codec)
         
         prem: bool = cls.SESSION.get_user_attribute(TYPE) == PREMIUM
+        if preference is not None:
+            Printer.debug(f"User Subscription Type: {'PREMIUM' if prem else 'FREE'}")
+        
         quality_options: dict[str, tuple[AudioQuality, str | None]] = {
         'lossless':  (AudioQuality.LOSSLESS,     None ), # upstream API does not yet support lossless, will fallback to auto 
         'very_high': (AudioQuality.VERY_HIGH,   '320k'),
@@ -699,7 +702,7 @@ class Zotify:
         return format_filter(quality), bitrate
     
     @classmethod
-    def get_content_stream(cls, content):
+    def get_content_stream(cls, content) -> LoadedStream | None:
         from zotify.api import DLContent, Track, Episode
         content: DLContent = content
         
@@ -730,7 +733,17 @@ class Zotify:
                 return cls.SESSION.content_feeder().load(content_id, auto_qual[0], False, None)
             except FeederException as e:
                 Printer.hashtaged(PrintChannel.WARNING, 'FAILED TO FETCH AUDIO FILE\n' +
-                                                       f'FALLBACK AUTO AUDIO QUALITY NOT AVAILABLE')
+                                                        'FALLBACK AUTO AUDIO QUALITY NOT AVAILABLE')
+        except ConnectionError as e:
+            if "Status code " in e.args[0]:
+                status_code = e.args[0].split("Status code ")[1]
+                Printer.hashtaged(PrintChannel.ERROR, 'FAILED TO FETCH AUDIO FILE\n' +
+                                                      f'CONNECTION ERROR WHEN FETCHING CONTENT STREAM - STATUS CODE {status_code}')
+                Printer._logger("\n".join(e.args), PrintChannel.ERROR)
+            else:
+                raise e
+        
+        return
     
     @classmethod
     def invoke_url(cls, url: str, params: dict | None = None, expectFail: bool = False) -> tuple[str, dict]:

@@ -138,8 +138,10 @@ class Content():
     
     def __init__(self, id_or_uri: str, _parent: Content | Container = None):
         self._clsn = "".join([" " + c if c.isupper() else c for c in self.__class__.__name__])[1:]
-        self._caps = self._clsn.upper() + "S"
-        self._lowers = self._caps.lower()
+        self._lowers = self._clsn.lower().removesuffix("y") +\
+                    ("ie" if self._clsn.endswith("y") else "") +\
+                    ("s" if not self._clsn.endswith("s") else "")
+        self._caps = self._lowers.upper()
         self._regex_flag: re.Pattern | None = None
         self._path_root: PurePath = Zotify.CONFIG.get_root_path()
         if ":" in id_or_uri:
@@ -916,7 +918,7 @@ class Track(DLContent):
         
         stream = Zotify.get_content_stream(self)
         if stream is None:
-            Printer.hashtaged(PrintChannel.ERROR, 'SKIPPING SONG - FAILED TO GET CONTENT STREAM\n' +
+            Printer.hashtaged(PrintChannel.ERROR, 'SKIPPING TRACK - FAILED TO GET CONTENT STREAM\n' +
                                                  f'Track_ID: {self.id}')
             return
         
@@ -1016,7 +1018,7 @@ class Episode(DLContent):
     def fetch_partner_url(self) -> str | None:
         _, resp = Zotify.invoke_url(PARTNER_URL + self.id + '"}&extensions=' + PERSISTED_QUERY)
         if resp[DATA][EPISODE] is None:
-            Printer.hashtaged(PrintChannel.WARNING, 'EPISODE PARTNER DATA MISSING - ASSUMING NON-EXTERNAL HOST\n' +
+            Printer.hashtaged(PrintChannel.WARNING, 'EPISODE PARTNER DATA MISSING - ASSUMING PLATFORM HOSTED\n' +
                                                    f'Episode_ID: {self.id}')
             return None
         direct_download_url = resp[DATA][EPISODE][AUDIO][ITEMS][-1][URL]
