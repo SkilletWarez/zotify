@@ -1,22 +1,28 @@
-import base64
-import datetime
 import json
 import logging
 import sys
 import re
 import requests
+from binascii import hexlify
+from base64 import b64encode, b64decode
 from contextlib import contextmanager
-from librespot.audio import FeederException, LoadedStream
+from datetime import datetime
+from google.protobuf.json_format import MessageToDict, ParseDict
+from librespot import metadata
+from librespot.audio import FeederException, GeneralAudioStream, CdnFeedHelper
 from librespot.audio.decoders import AudioQuality, SuperAudioFormat, FormatOnlyAudioQuality
 from librespot.core import Session, OAuth, MercuryRequests
-from librespot.metadata import TrackId, EpisodeId
 from librespot.proto.Authentication_pb2 import AuthenticationType
+from librespot.proto.Metadata_pb2 import AudioFile
 from pathlib import Path, PurePath
 from time import sleep
 from typing import Any, Callable
 
+from zotify import __version__
 from zotify.const import *
 from zotify.termoutput import Printer, PrintChannel, Loader
+
+FORCE_STREAM_API_CALL = False
 
 
 CONFIG_VALUES = {
@@ -91,7 +97,7 @@ CONFIG_VALUES = {
     LYRICS_MD_HEADER:           { 'default': 'False',                   'type': bool,   'arg': ('--lyrics-md-header'                     ,) },
     
     # Metadata Options
-    BYPASS_MD_API:              { 'default': 'False',                   'type': bool,   'arg': ('--bypass-metadata-api'                  ,) },
+    API_CLIENT_ID:              { 'default': '',                        'type': str,    'arg': ('--client-id'                            ,) },
     LANGUAGE:                   { 'default': 'en',                      'type': str,    'arg': ('--language'                             ,) },
     MD_DISC_TRACK_TOTALS:       { 'default': 'True',                    'type': bool,   'arg': ('--md-disc-track-totals'                 ,) },
     MD_SAVE_GENRES:             { 'default': 'True',                    'type': bool,   'arg': ('--md-save-genres'                       ,) },
@@ -136,6 +142,8 @@ DEPRECIATED_CONFIGS = {
     "DOWNLOAD_LYRICS":          { 'default': 'True',                    'type': bool,   'arg': ('--download-lyrics'                      ,) },
     "LYRICS_FILENAME":          { 'default': '{artist}_{song_name}',    'type': str,    'arg': ('--lyrics-filename'                      ,) },
     "MD_SAVE_LYRICS":           { 'default': 'True',                    'type': bool,   'arg': ('--md-save-lyrics'                       ,) },
+    "BYPASS_MD_API":            { 'default': 'False',                   'type': bool,   'arg': ('--bypass-metadata-api'                  ,) },
+    
 }
 
 
@@ -238,8 +246,8 @@ class Config:
     def get(cls, key: str) -> Any:
         return cls.Values.get(key)
     
-    @contextmanager
     @classmethod
+    @contextmanager
     def temporary_config(cls, cfg: str, temp_value):
         from zotify.utils import safe_typecast
         original_val = cls.get(cfg)
@@ -279,26 +287,19 @@ class Config:
     
     @classmethod
     def get_credentials_location(cls) -> PurePath:
-        if cls.get(CREDENTIALS_LOCATION) == '':
+        cred_str: str = cls.get(CREDENTIALS_LOCATION)
+        if not cred_str:
             system_paths = {
                 'win32': Path.home() / 'AppData/Roaming/Zotify',
                 'linux': Path.home() / '.local/share/zotify',
                 'darwin': Path.home() / 'Library/Application Support/Zotify'
             }
-            if sys.platform not in system_paths:
-                credentials_path = PurePath(Path.cwd() / '.zotify')
-            else:
-                credentials_path = PurePath(system_paths[sys.platform])
+            cred_dir_or_file = system_paths.get(sys.platform, Path.cwd() / '.zotify')
+        elif cred_str[0] == ".":
+            cred_dir_or_file = Path(cls.get_root_path()) / Path(cred_str).expanduser().relative_to(".")
         else:
-            cred_path_str: str = cls.get(CREDENTIALS_LOCATION)
-            if cred_path_str[0] == ".":
-                credentials_path = cls.get_root_path() / PurePath(cred_path_str).relative_to(".")
-            else:
-                credentials_path = PurePath(cred_path_str)
-        
-        credentials = Path(credentials_path).expanduser()
-        if credentials.is_dir():
-            credentials = credentials / 'credentials.json'
+            cred_dir_or_file = Path(cred_str).expanduser()
+        credentials = cred_dir_or_file if cred_dir_or_file.suffix else cred_dir_or_file / 'credentials.json'
         credentials.parent.mkdir(parents=True, exist_ok=True)
         return PurePath(credentials)
     
@@ -318,7 +319,7 @@ class Config:
         elif dl_obj_clsn == 'Liked Song':
             v = cls.get(OUTPUT_LIKED_SONGS)
         else:
-            raise ValueError()
+            raise ValueError(f'INVALID DOWNLOAD OBJECT CLASS "{dl_obj_clsn}"')
         
         if cls.get_split_album_discs() and dl_obj_clsn == "Album":
             return str(PurePath(v).parent / 'Disc {disc_number}' / PurePath(v).name)
@@ -366,23 +367,20 @@ class Config:
     
     @classmethod
     def get_song_archive_location(cls) -> PurePath:
-        if cls.get(SONG_ARCHIVE_LOCATION) == '':
+        song_archive_str: str = cls.get(SONG_ARCHIVE_LOCATION)
+        if not song_archive_str:
             system_paths = {
                 'win32': Path.home() / 'AppData/Roaming/Zotify',
                 'linux': Path.home() / '.local/share/zotify',
                 'darwin': Path.home() / 'Library/Application Support/Zotify'
             }
-            if sys.platform not in system_paths:
-                song_archive =  PurePath(Path.cwd() / '.zotify/.song_archive')
-            else:
-                song_archive = PurePath(system_paths[sys.platform] / '.song_archive')
+            song_archive_dir = system_paths.get(sys.platform, Path.cwd() / '.zotify')
+        elif song_archive_str[0] == ".":
+            song_archive_dir = Path(cls.get_root_path()) / Path(song_archive_str).expanduser().relative_to(".")
         else:
-            song_archive_path: str = cls.get(SONG_ARCHIVE_LOCATION)
-            if song_archive_path[0] == ".":
-                song_archive_path = cls.get_root_path() / PurePath(song_archive_path).relative_to(".")
-            song_archive = PurePath(Path(song_archive_path).expanduser() / ".song_archive")
-        Path(song_archive.parent).mkdir(parents=True, exist_ok=True)
-        return song_archive
+            song_archive_dir = Path(song_archive_str).expanduser()
+        song_archive_dir.mkdir(parents=True, exist_ok=True)
+        return PurePath(song_archive_dir / '.song_archive')
     
     @classmethod
     def get_temp_download_dir(cls) -> str | PurePath:
@@ -418,7 +416,7 @@ class Config:
         return cls.get(RETRY_ATTEMPTS)
     
     @classmethod
-    def get_disable_directory_archives(cls) -> bool:
+    def get_disable_dir_archives(cls) -> bool:
         return cls.get(DISABLE_DIRECTORY_ARCHIVES)
     
     @classmethod
@@ -427,7 +425,7 @@ class Config:
     
     @classmethod
     def get_ffmpeg_log_level(cls) -> str:
-        level = cls.get(FFMPEG_LOG_LEVEL)
+        level = str(cls.get(FFMPEG_LOG_LEVEL)).lower()
         # see https://ffmpeg.org/ffmpeg.html#Generic-options, -loglevel
         valid_levels = {"trace", "debug", "verbose", "info", "warning", "error", "fatal", "panic", "quiet"}
         
@@ -511,9 +509,6 @@ class Config:
     
     @classmethod
     def get_download_parent_album(cls) -> bool:
-        if Zotify.CONFIG.get_bypass_metadata():
-            return False
-        
         return cls.get(DOWNLOAD_PARENT_ALBUM)
     
     @classmethod
@@ -615,27 +610,27 @@ class Config:
         return cls.get(LYRICS_MD_HEADER)
     
     @classmethod
-    def get_bypass_metadata(cls) -> bool:
-        return cls.get(BYPASS_MD_API)
+    def get_api_client_id(cls) -> str:
+        return cls.get(API_CLIENT_ID)
 
 
 class Zotify:
-    CONFIG: Config         = Config()
-    OAUTH: OAuth           = None
-    SESSION: Session       = None
-    TOTAL_API_CALLS: int   = None
-    DATETIME_LAUNCH: str   = None
-    LOGGER: logging.Logger = None
-    LOGFILE: Path          = None
-    DOWNLOAD_QUALITY       = None
-    DOWNLOAD_BITRATE       = None
+    CONFIG              : Config                    = Config()
+    OAUTH               : OAuth                     = None
+    SESSION             : Session                   = None
+    TOTAL_API_CALLS     : int                       = None
+    DATETIME_LAUNCH     : str                       = None
+    LOGGER              : logging.Logger            = None
+    LOGFILE             : Path                      = None
+    DOWNLOAD_QUALITY    : FormatOnlyAudioQuality    = None
+    DOWNLOAD_BITRATE    : str                       = None
     
     @classmethod
     def start(cls) -> None:
-        if Zotify.TOTAL_API_CALLS:
-            Printer.debug(f"Total API Calls: {Zotify.TOTAL_API_CALLS}")
-        Zotify.DATETIME_LAUNCH = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        Zotify.TOTAL_API_CALLS = 0
+        if cls.TOTAL_API_CALLS:
+            Printer.debug(f"Total API Calls: {cls.TOTAL_API_CALLS}")
+        cls.DATETIME_LAUNCH = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        cls.TOTAL_API_CALLS = 0
     
     @classmethod
     def login(cls, args):
@@ -646,24 +641,26 @@ class Zotify:
         
         # login via saved credentials
         cred_path = cls.CONFIG.get_credentials_location()
-        if Zotify.CONFIG.get_save_credentials() and Path(cred_path).exists():
+        if cls.CONFIG.get_save_credentials() and Path(cred_path).exists():
             with open(cred_path, 'r',) as f:
                 creds = json.load(f)
-            if creds["type"] == OAuth.OAUTH_PKCE_TOKEN:
-                cls.OAUTH = OAuth(creds["client_id"], "", None).ingest_token_response(creds)
-                try:
+            try:
+                if creds["type"] == OAuth.OAUTH_PKCE_TOKEN:
+                    cls.CONFIG.Values[API_CLIENT_ID] = creds["client_id"]
+                    cls.OAUTH = OAuth(cls.CONFIG.get_api_client_id(), "", None).ingest_token_response(creds)
                     cls.OAUTH.refresh_token()
                     cls.OAUTH.save_creds(cred_path)
                     session_builder.login_credentials = cls.OAUTH.get_credentials()
                     cls.SESSION = session_builder.create()
                     return
-                except RuntimeError:
-                    Printer.hashtaged(PrintChannel.MANDATORY, f"Login via saved OAuth credentials failed! Falling back to interactive login")
-                    # Path(cred_path).unlink()
-            else:
-                session_builder.stored_file(cred_path)
-                cls.SESSION = session_builder.create()
-                return
+                else:
+                    cls.CONFIG.Values[API_CLIENT_ID] = ""
+                    session_builder.stored_file(cred_path)
+                    cls.SESSION = session_builder.create()
+                    return
+            except RuntimeError:
+                Printer.hashtaged(PrintChannel.MANDATORY, f'Login via saved {creds["type"]} credentials failed! Falling back to interactive login')
+                # Path(cred_path).unlink()
         
         # login via commandline args (login5 token only)
         if args.username not in {None, ""} and args.token not in {None, ""}:
@@ -671,7 +668,7 @@ class Zotify:
                 auth_obj = {"username": args.username,
                             "credentials": args.token,
                             "type": AuthenticationType.keys()[1]}
-                auth_as_bytes = base64.b64encode(json.dumps(auth_obj, ensure_ascii=True).encode("ascii"))
+                auth_as_bytes = b64encode(json.dumps(auth_obj, ensure_ascii=True).encode("ascii"))
                 cls.SESSION = session_builder.stored(auth_as_bytes).create()
                 return
             except:
@@ -680,12 +677,14 @@ class Zotify:
         # interactive OAuth login
         port = 4381
         redirect_url = f"http://{cls.CONFIG.get_oauth_address()}:{port}/login"
-        client_id = args.client_id if args.client_id not in {None, ""} else MercuryRequests.keymaster_client_id
         def oauth_print(url):
             Printer.new_print(PrintChannel.MANDATORY, f"Click on the following link to login:\n{url}")
+        
+        client_id = cls.CONFIG.get_api_client_id()
+        if not client_id: client_id = MercuryRequests.keymaster_client_id
         oauth = OAuth(client_id, redirect_url, oauth_print).set_scopes(SCOPES).set_listen_all(True)
         session_builder.login_credentials = oauth.flow()
-        if Zotify.CONFIG.get_save_credentials():
+        if cls.CONFIG.get_save_credentials():
             if client_id != MercuryRequests.keymaster_client_id:
                 cls.OAUTH = oauth
                 oauth.save_creds(cred_path)
@@ -696,16 +695,8 @@ class Zotify:
         return
     
     @classmethod
-    def get_download_quality(cls, preference: str | None = None) -> tuple[FormatOnlyAudioQuality, str | None]:
-        
-        def format_filter(quality: AudioQuality) -> FormatOnlyAudioQuality:
-           codec = SuperAudioFormat.FLAC if quality is AudioQuality.LOSSLESS else SuperAudioFormat.VORBIS
-           return FormatOnlyAudioQuality(quality, codec)
-        
+    def parse_dl_quality(cls, preference: str | None = None) -> tuple[bool, FormatOnlyAudioQuality, str | None]:
         prem: bool = cls.SESSION.get_user_attribute(TYPE) == PREMIUM
-        if preference is not None:
-            Printer.debug(f"User Subscription Type: {'PREMIUM' if prem else 'FREE'}")
-        
         quality_options: dict[str, tuple[AudioQuality, str | None]] = {
         'lossless':  (AudioQuality.LOSSLESS,     None ), # upstream API does not yet support lossless, will fallback to auto 
         'very_high': (AudioQuality.VERY_HIGH,   '320k'),
@@ -714,96 +705,85 @@ class Zotify:
         'normal':    (AudioQuality.NORMAL,      '96k' ),
         }
         
+        def format_filter(quality: AudioQuality) -> FormatOnlyAudioQuality:
+           codec = SuperAudioFormat.FLAC if quality is AudioQuality.LOSSLESS else SuperAudioFormat.VORBIS
+           return FormatOnlyAudioQuality(quality, codec)
         if preference is None:
             quality, bitrate = quality_options["auto"]
-            return format_filter(quality), bitrate
+            return prem, format_filter(quality), bitrate
         
         pref = quality_options.get(preference, quality_options["auto"])
         quality, bitrate = quality_options["high"] if (pref[-1] is None or int(pref[-1][:-1]) > 160) and not prem else pref
-        return format_filter(quality), bitrate
+        return prem, format_filter(quality), bitrate
     
     @classmethod
-    def configure(cls, args):
+    def boot(cls, args):
         Printer.splash()
-        Zotify.start()
-        Zotify.CONFIG.load(args)
+        cls.start()
+        cls.CONFIG.load(args)
         
         # Handle sub-library logging
-        Zotify.LOGFILE = Path(Zotify.CONFIG.get_root_path() / 
-                         ("zotify_" + ("DEBUG_" if Zotify.CONFIG.debug() else "") + f"{Zotify.DATETIME_LAUNCH}.log"))
-        Printer.hashtaged(PrintChannel.DEBUG, f"{Zotify.LOGFILE.name} logging to {Zotify.LOGFILE.resolve().parent}")
-        logging.basicConfig(level=logging.DEBUG if Zotify.CONFIG.debug() else logging.CRITICAL,
-                            filemode="x", filename=Zotify.LOGFILE)
+        cls.LOGFILE = Path(cls.CONFIG.get_root_path() / 
+                         ("zotify_" + ("DEBUG_" if cls.CONFIG.debug() else "") + f"{cls.DATETIME_LAUNCH}.log"))
+        Printer.hashtaged(PrintChannel.DEBUG, f"{cls.LOGFILE.name} logging to {cls.LOGFILE.resolve().parent}")
+        logging.basicConfig(level=logging.DEBUG if cls.CONFIG.debug() else logging.CRITICAL,
+                            filemode="x", filename=cls.LOGFILE)
         
         with Loader("Logging in...", PrintChannel.MANDATORY):
             login_try = 0
             while login_try <= cls.CONFIG.get_retry_attempts():
                 login_try += 1
-                try: Zotify.login(args)
+                try: cls.login(args)
                 except ConnectionError as e:
-                    Printer.hashtaged(PrintChannel.WARNING, f"LOGIN FAILED ({e.args[0]})\n" + 
-                                                             "TRYING AGAIN AFTER SMALL WAIT")
+                    Printer.hashtaged(PrintChannel.WARNING, f'LOGIN FAILED ({e.args[0]})\n' + 
+                                                             'TRYING AGAIN AFTER SMALL WAIT')
                     sleep(3)
-        Zotify.LOGGER = logging.getLogger("zotify.debug")
+        cls.LOGGER = logging.getLogger("zotify.debug")
         
-        Printer.debug("Session Initialized Successfully")
-        quality, bitrate = cls.get_download_quality(Zotify.CONFIG.get_download_qual_pref())
-        Zotify.DOWNLOAD_QUALITY = quality
-        Zotify.DOWNLOAD_BITRATE = bitrate
+        prem, quality, bitrate = cls.parse_dl_quality(cls.CONFIG.get_download_qual_pref())
+        cls.DOWNLOAD_QUALITY = quality
+        cls.DOWNLOAD_BITRATE = bitrate
+        Printer.debug(f'{"CLIENT_ID" if cls.OAUTH else ""} Session Initialized Successfully\n' +
+                      f'User Subscription Type: {"PREMIUM" if prem else "FREE"}\n' +
+                      f'Zotify Version v{__version__}')
     
-    @classmethod
-    def get_content_stream(cls, content) -> LoadedStream | None:
-        from zotify.api import DLContent, Track, Episode
-        content: DLContent = content
-        
-        if isinstance(content, Track):
-            content_id = TrackId.from_base62(content.id)
-        elif isinstance(content, Episode):
-            content_id = EpisodeId.from_base62(content.id)
-        else:
-            return
-        
+    @staticmethod
+    def id_from_gid(gid: str) -> str:
+        return metadata.Id.b62.encode(b64decode(gid.encode())).decode()
+    
+    @staticmethod
+    def hex_id_from_file_id(file_id: str) -> str:
+        return hexlify(b64decode(file_id.encode())).decode()
+    
+    @staticmethod
+    def to_libre_content(ContClass: type, uri: str) -> metadata.Id | None:
         try:
-            return cls.SESSION.content_feeder().load(content_id, Zotify.DOWNLOAD_QUALITY, False, None)
-        except RuntimeError as e:
-            if 'Failed fetching audio key!' in e.args[0]:
-                gid, fileid = e.args[0].split('! ')[1].split(', ')
-                Printer.hashtaged(PrintChannel.ERROR, 'FAILED TO FETCH AUDIO KEY\n' +
-                                                      'MAY BE CAUSED BY RATE LIMITS - CONSIDER INCREASING `BULK_WAIT_TIME`\n' +
-                                                     f'GID: {gid[5:]} - File_ID: {fileid[8:]}')
-                Printer.logger("\n".join(e.args), PrintChannel.ERROR)
-            else:        
-                raise e
-        except FeederException as e:
-            preference = Zotify.DOWNLOAD_QUALITY.preferred.name
-            Printer.hashtaged(PrintChannel.WARNING, 'FAILED TO FETCH AUDIO FILE\n' +
-                                                   f'PREFERED AUDIO QUALITY {preference} NOT AVAILABLE - FALLING BACK TO AUTO')
-            auto_qual = cls.get_download_quality()
-            try:
-                return cls.SESSION.content_feeder().load(content_id, auto_qual[0], False, None)
-            except FeederException as e:
-                Printer.hashtaged(PrintChannel.WARNING, 'FAILED TO FETCH AUDIO FILE\n' +
-                                                        'FALLBACK AUTO AUDIO QUALITY NOT AVAILABLE')
-        except ConnectionError as e:
-            if "Status code " in e.args[0]:
-                status_code = e.args[0].split("Status code ")[1]
-                Printer.hashtaged(PrintChannel.ERROR, 'FAILED TO FETCH AUDIO FILE\n' +
-                                                      f'CONNECTION ERROR WHEN FETCHING CONTENT STREAM - STATUS CODE {status_code}')
-                Printer.logger("\n".join(e.args), PrintChannel.ERROR)
-            else:
-                raise e
-        
-        return
+            libre_content_type: metadata.Id = getattr(metadata, ContClass.clsn + "Id")
+            return libre_content_type.from_base62(uri.split(":")[-1])
+        except:
+            return
     
     @classmethod
-    def invoke_url(cls, url: str, params: dict | None = None, expectFail: bool = False, force_login5: bool = False) -> tuple[str, dict]:
-        if cls.CONFIG.get_bypass_metadata():
-            Printer.hashtaged(PrintChannel.MANDATORY, 'METADATA BYPASS ENABLED - API REQUESTS NON-FUNCTIONAL')
-            return ("", {"error": {"status": "Disabled", "message": "No request sent"}})
-        
+    def invoke_libre_md(cls, ContClass: type, uri: str) -> dict:
+        try:
+            content_id = cls.to_libre_content(ContClass, uri)
+            if ContClass.clsn == "Playlist":
+                proto = cls.SESSION.api().get_playlist(content_id)
+            else:
+                proto = getattr(cls.SESSION.api(), f"get_metadata_4_{ContClass.type_attr}")(content_id)
+            resp = MessageToDict(proto, preserving_proto_field_name=True)
+            if resp.get(GID): resp[GID] = proto.gid # use gid in bytes
+            return resp
+        except Exception as e:
+            Printer.debug(f"Failed to fetch metadata for {uri}")
+            Printer.traceback(e)
+            return {}
+    
+    @classmethod
+    def invoke_url(cls, url: str, params: dict | None = None, expectFail: bool = False, force_login5: bool = False) -> dict:
         def choose_token() -> str:
             if cls.OAUTH and not force_login5:
-                return cls.OAUTH.token() # Developer API
+                return cls.OAUTH.token()
             return cls.SESSION.tokens().get_token(*SCOPES).access_token
         
         headers = {
@@ -816,43 +796,43 @@ class Zotify:
         
         tryCount = 0
         while tryCount <= cls.CONFIG.get_retry_attempts():
-            response = requests.get(url, headers=headers, params=params)
+            resp = requests.get(url, headers=headers, params=params)
             cls.TOTAL_API_CALLS += 1
-            
+            if resp.status_code == 403 and not expectFail:
+                Printer.hashtaged(PrintChannel.WARNING, f'API ERROR\n' +
+                                                        f'ATTEMPTING TO ACCESS FORBIDDEN ENDPOINT')
+                return {}
             try:
-                responsetext = response.text
-                responsejson = response.json()
+                responsejson = resp.json()
                 if not responsejson:
-                    raise json.decoder.JSONDecodeError
-                # responsejson = {"error": {"status": "Unknown", "message": "Received an empty response"}}
+                    raise json.decoder.JSONDecodeError()
             except json.decoder.JSONDecodeError:
-                responsejson = {"error": {"status": "Unknown", "message": "Received an empty response"}}
-            
-            if responsejson and not 'error' in responsejson:
-                return responsetext, responsejson
+                responsejson = {ERROR: {STATUS: "Unknown", MESSAGE: "Received an empty response"}}
+            if resp.ok and resp.status_code == 200 and not responsejson.get(ERROR):
+                return responsejson
             elif not expectFail:
                 Printer.hashtaged(PrintChannel.WARNING, f'API ERROR (TRY {tryCount}) - RETRYING\n' +
-                                                        f'{responsejson["error"]["status"]}:  {responsejson["error"]["message"]}')
+                                                        f'{STATUS} {responsejson.get(ERROR, {}).get(STATUS, "Unknown")}:  '+
+                                                        f'{responsejson.get(ERROR, {}).get(MESSAGE, "No message provided")}')
             
             tryCount += 1
             if tryCount > cls.CONFIG.get_retry_attempts():
                 break
-            
             sleep(5 if not expectFail else 1)
         
         if not expectFail:
             Printer.hashtaged(PrintChannel.API_ERROR, f'RETRY LIMIT EXCEDED\n' +
-                                                      f'RESPONSE TEXT: {responsetext}\n' +
+                                                      f'RESPONSE TEXT: {Printer.pretty(responsejson)}\n' +
                                                       f'URL: {Printer.pretty(url)}')
         
-        return responsetext, responsejson
+        return {}
     
     @classmethod
     def invoke_url_nextable(cls, url: str, response_key: str = ITEMS, stop: int = 0, limit: int = 50, offset: int = 0,
                             stripper: str | tuple[str] | None = None, params: dict | None = None) -> list[dict] | dict[list[dict]]:
         p = {LIMIT: limit, OFFSET: offset}
         if params: p.update(params)
-        _, resp = cls.invoke_url(url, p)
+        resp = cls.invoke_url(url, p)
         
         items: dict[str | None, list[dict]] = dict()
         strippers = stripper if isinstance(stripper, tuple) else (stripper,)
@@ -860,15 +840,15 @@ class Zotify:
             nextable: dict = resp.get(strip, resp)
             
             if response_key not in nextable:
-                Printer.hashtaged(PrintChannel.WARNING, f'Key "{response_key}" not found in API response: {nextable}')
-                continue
+                Printer.hashtaged(PrintChannel.WARNING, f'KEY "{response_key}" NOT FOUND IN API RESPONSE: {nextable}')
+                return []
             
             items[strip] = nextable[response_key]
             while nextable.get(NEXT) is not None and not (stop and len(items[strip]) >= stop):
-                _, nextable = Zotify.invoke_url(nextable[NEXT])
+                nextable = cls.invoke_url(nextable[NEXT])
                 if len(strippers) > 1: nextable: dict = nextable.get(strip, nextable)
                 if response_key not in nextable:
-                    Printer.hashtaged(PrintChannel.WARNING, f'Key "{response_key}" not found in paginated API response: {nextable}')
+                    Printer.hashtaged(PrintChannel.WARNING, f'KEY "{response_key}" NOT FOUND IN PAGINATED API RESPONSE: {nextable}')
                     break
                 items[strip].extend(nextable[response_key])
             if stop:
@@ -883,23 +863,83 @@ class Zotify:
             items_batch = '%2c'.join(bulk_items[:limit])
             bulk_items = bulk_items[limit:]
             
-            _, resp = Zotify.invoke_url(url + items_batch)
-            items.extend(resp[stripper]) # stripper must be present, handled by the caller
+            resp = cls.invoke_url(url + items_batch)
+            if not resp: # assume 403 forbidden, warning handled in invoke_url
+                return items
+            elif not resp.get(stripper):
+                Printer.hashtaged(PrintChannel.WARNING, f'STRIPPER "{stripper}" NOT FOUND IN API RESPONSE FOR BULK URL: {url}')
+                continue
+            items.extend(resp[stripper])
         return items
     
     @classmethod
-    def cleanup(cls) -> None:
-        Zotify.start()
+    def get_content_stream(cls, content, use_qual_pref: bool = True) -> GeneralAudioStream | None:
+        global FORCE_STREAM_API_CALL
+        from zotify.api import DLContent
+        if not isinstance(content, DLContent): return
+        content_id = cls.to_libre_content(content.__class__, content.uri)
+        if not content_id: return
+        qual = cls.DOWNLOAD_QUALITY if use_qual_pref else cls.parse_dl_quality()[1]
+        Printer.logger(f'Fetching stream for {content.uri} at quality {qual.preferred.name}')
+        try:
+            if not content.file_ids or FORCE_STREAM_API_CALL:
+                risky_method = False
+                lds = cls.SESSION.content_feeder().load(content_id, qual, False, None)
+                return lds.input_stream if lds else None
+            risky_method = True
+            if getattr(content, "external_url", None):
+                url = cls.SESSION.client().head(content.external_url).url
+                return cls.SESSION.cdn().stream_external_episode(content, url, None)
+            file = qual.get_file([ParseDict(f, AudioFile()) for f in content.file_ids])
+            key = cls.SESSION.audio_key().get_audio_key(content.gid, file.file_id)
+            url = cls.SESSION.content_feeder().resolve_storage_interactive(file.file_id, False)
+            streamer = cls.SESSION.cdn().stream_file(file, key, CdnFeedHelper.get_url(url), None)
+            if streamer.stream().skip(0xA7) != 0xA7: raise IOError("Couldn't skip 0xa7 bytes!")
+            return streamer
+        except FeederException as e:
+            if not use_qual_pref:
+                Printer.hashtaged(PrintChannel.ERROR, 'FAILED TO FETCH AUDIO FILE\n' +
+                                                      'FALLBACK (AUTO) AUDIO QUALITY NOT AVAILABLE')
+                return
+            preference = cls.DOWNLOAD_QUALITY.preferred.name
+            Printer.hashtaged(PrintChannel.WARNING, 'FAILED TO FETCH AUDIO FILE\n' +
+                                                   f'PREFERED AUDIO QUALITY {preference} NOT AVAILABLE - FALLING BACK TO AUTO')
+            return cls.get_content_stream(content, use_qual_pref=False)
+        except RuntimeError as e:
+            if 'Failed fetching audio key!' not in e.args[0]: raise
+            gid, fileid = e.args[0].split('! ')[1].split(', ')
+            Printer.hashtaged(PrintChannel.ERROR, 'FAILED TO FETCH AUDIO KEY\n' +
+                                                  'MAY BE CAUSED BY RATE LIMITS - CONSIDER INCREASING `BULK_WAIT_TIME`\n' +
+                                                 f'GID: {gid[5:]} - File_ID: {fileid[8:]}')
+            Printer.logger("\n".join(e.args), PrintChannel.ERROR)
+        except ConnectionError as e:
+            if "Status code " not in e.args[0]: raise
+            status_code = e.args[0].split("Status code ")[1]
+            Printer.hashtaged(PrintChannel.ERROR, 'FAILED TO FETCH AUDIO FILE\n' +
+                                                 f'CONNECTION ERROR WHEN FETCHING CONTENT STREAM - STATUS CODE {status_code}')
+            Printer.logger("\n".join(e.args), PrintChannel.ERROR)
+        except Exception as e:
+            if risky_method:
+                FORCE_STREAM_API_CALL = True
+                return cls.get_content_stream(content, use_qual_pref=use_qual_pref)
+            Printer.hashtaged(PrintChannel.ERROR, 'FAILED TO FETCH AUDIO STREAM\n' +
+                                                  'AN UNEXPECTED ERROR OCCURED - CHECK LOGS FOR DETAILS')
+            Printer.traceback(e)
+        return None
+    
+    @classmethod
+    def end(cls) -> None:
+        cls.start()
         logging.shutdown()
         
         # delete non-debug logfiles if empty (no critical errors)
-        if Zotify.LOGFILE.exists():
-            with open(Zotify.LOGFILE) as file:
+        if cls.LOGFILE.exists():
+            with open(cls.LOGFILE) as file:
                 lines = file.readlines()
             if not lines:
-                Zotify.LOGFILE.unlink()
+                cls.LOGFILE.unlink()
         
-        for dir in (Path(Zotify.CONFIG.get_root_path()), Path(Zotify.CONFIG.get_root_podcast_path())):
+        for dir in (Path(cls.CONFIG.get_root_path()), Path(cls.CONFIG.get_root_podcast_path())):
             for tempfile in dir.glob("*.tmp"):
                     tempfile.unlink()
         

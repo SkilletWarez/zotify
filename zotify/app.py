@@ -45,7 +45,7 @@ def filter_search_query(search_query: str, item_types: tuple[str]) -> dict[str, 
     max_offset = 1000
     max_limit = 50
     for k, v in list(search_filters.items()):
-        if   k == TYPE:                fv = ",".join([t for t in v[-1].split() if t in item_types])
+        if   k == TYPE:                fv = ",".join([t for t in v[-1].split(",") if t in item_types])
         elif k == SEARCH_QUERY_SIZE:   fv = str(clamp(0, int(v[-1]), max_offset + max_limit))
         elif k == OFFSET:              fv = str(clamp(0, int(v[-1]), max_offset            ))
         elif k == INCLUDE_EXTERNAL:    fv = "audio" if v[-1].lower() == "true" else ""
@@ -109,6 +109,7 @@ def fetch_search_display(search_query: str) -> list[str]:
 
 def search_and_select(search: str = ""):
     """ Perform search Queries and allow user to select results """
+    from zotify.api import Query
     
     while not search or search == ' ':
         search = Printer.get_input('Enter search: ')
@@ -124,7 +125,6 @@ def search_and_select(search: str = ""):
         Printer.hashtaged(PrintChannel.MANDATORY, 'NO RESULTS FOUND - EXITING...')
         return
     
-    from zotify.api import Query
     uris: list[str] = select(search_result_uris)
     Query(Zotify.DATETIME_LAUNCH).request(' '.join(uris)).execute()
 
@@ -148,8 +148,11 @@ def perform_query(args: Namespace) -> None:
             if len(urls) > 0:
                 Query(Zotify.DATETIME_LAUNCH).request(urls).execute()
         
-        elif Zotify.CONFIG.get_bypass_metadata():
-            Printer.hashtaged(PrintChannel.MANDATORY, 'METADATA BYPASS ENABLED - NON-URL MODES NON-FUNCTIONAL')
+        elif args.verify_library:
+            VerifyLibrary(Zotify.DATETIME_LAUNCH).execute()
+        
+        elif not Zotify.CONFIG.get_api_client_id():
+            Printer.hashtaged(PrintChannel.MANDATORY, 'NO DEVELOPER CLIENT - SEARCH AND USERITEM QUERIES NON-FUNCTIONAL')
             return
         
         elif args.liked_songs:
@@ -164,18 +167,15 @@ def perform_query(args: Namespace) -> None:
         elif args.followed_albums:
             SavedAlbum(Zotify.DATETIME_LAUNCH).execute()
         
-        elif args.verify_library:
-            VerifyLibrary(Zotify.DATETIME_LAUNCH).execute()
-        
         elif args.search:
             search_and_select(args.search)
         
         else:
             search_and_select()
     
-    except BaseException as e:
-        Zotify.cleanup()
-        raise e
+    except BaseException:
+        Zotify.end()
+        raise
 
 
 def client(args: Namespace, modes: list[Action]) -> None:
@@ -224,4 +224,4 @@ def client(args: Namespace, modes: list[Action]) -> None:
         Zotify.start()
         perform_query(args)
     
-    Zotify.cleanup()
+    Zotify.end()

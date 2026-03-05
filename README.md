@@ -85,7 +85,6 @@ If an artist's URL is given, all albums by the specified artist will be download
 | `-c`, `--config-location`           | Specify a directory containing a Zotify `config.json` file (or a filepath to a `.json` file) to load settings  |
 | `-u`, `--username`                  | Account username                                                                                               |
 | `--token`                           | Authentication token                                                                                           |
-| `--client-id`                       | Client ID for a Developer App to reroute metadata API requests through                                         |
 
 | Command Line Mode Flag (exclusive)  | Mode                                                                                                           |
 |-------------------------------------|----------------------------------------------------------------------------------------------------------------|
@@ -177,7 +176,7 @@ Set arguments in the commandline like this: `-ie False` or `--codec mp3`. Wrap c
 
 | Metadata Options             | Command Line Config Flag            | Description                                                                              | Default Value |
 |------------------------------|-------------------------------------|------------------------------------------------------------------------------------------|---------------|
-| `BYPASS_MD_API`              | `--bypass-metadata-api`             | Whether API calls should be disabled (can only download Tracks or Episodes in URL mode)  | False         |
+| `API_CLIENT_ID`              | `--client-id`                       | Client ID for a Developer App to route metadata API requests through                     | `""`          |
 | `LANGUAGE`                   | `--language`                        | Language in which metadata/tags are requested                                            | en            |
 | `MD_DISC_TRACK_TOTALS`       | `--md-disc-track-totals`            | Whether track totals and disc totals should be saved in metadata                         | True          |
 | `MD_SAVE_GENRES`             | `--md-save-genres`                  | Whether genres should be saved in metadata                                               | True          |
@@ -283,7 +282,7 @@ Multiple filters can be stacked, with latter filters overwriting prior filters. 
 
 | Filter Tag                  | Type       | Valid Values                                              | Default Value                    |
 |-----------------------------|------------|-----------------------------------------------------------|----------------------------------|
-| `/t`, `/type`               | `ITEMTYPE` | `track`, `album`, `artist`, `playlist`, `show`, `episode` | `track album artist playlist`    |
+| `/t`, `/type`               | `ITEMTYPE` | `track`, `album`, `artist`, `playlist`, `show`, `episode` | `track,album,artist,playlist`    |
 | `/s`, `/size`               | int        | 0 < i <= 1050                                             | `SEARCH_QUERY_SIZE` Config == 10 |
 | `/o`, `/offset`             | int        | 0 < i <= 1000                                             | 0                                |
 | `/ie`, `/include-external`  | bool       | True, False                                               | False                            |
@@ -296,7 +295,7 @@ Search for Lots of Artists                   :   `Taylor /t artist /s 50`
 
 Skip the First 100 Search Results            :   `LMFAO Party Rock /o 100`
 
-Smaller Default Search, Including Podcasts   :   `Country /t track album artist playlist episode /s 5`
+Smaller Default Search, Including Podcasts   :   `Country /t track,album,artist,playlist,episode /s 5`
 
 Search for Externally-Hosted Podcasts        :   `Life is Crazy Sometimes /t show /ie True /s 30`
 
@@ -312,7 +311,7 @@ Check for Live Performances   :   `^.*?\\(?(?:Live|Live (?:from|in|at) .*?)\\)?$
 
 ## FFMPEG Argument Formatting
 
-With `CUSTOM_FFMEPG_ARGS` (or the commandline parameter `--custom-ffmpeg-args`), you can specify additional audio processing functions to be applied to downloaded audio files. To understand available FFMPEG options and filtergraphs, see the [FFMPEG Documentation](https://ffmpeg.org/ffmpeg.html#Audio-Options) and [FFMPEG Filters Documentation](https://ffmpeg.org/ffmpeg-filters.html#Audio-Filters). Make sure to escape any extra quotes `"` used in the Regex, as the argument parser expects a single string of space-delimited key-value pairs.
+With `CUSTOM_FFMEPG_ARGS` (or the commandline parameter `--custom-ffmpeg-args`), you can specify additional audio processing functions to be applied to downloaded audio files. To understand available FFMPEG options and filtergraphs, see the [FFMPEG Documentation](https://ffmpeg.org/ffmpeg.html#Audio-Options) and [FFMPEG Filters Documentation](https://ffmpeg.org/ffmpeg-filters.html#Audio-Filters). Make sure to escape any extra quotes `"`, as the argument parser expects a single string of space-delimited key-value pairs.
 
 ### Example FFMPEG Argument Values
 
